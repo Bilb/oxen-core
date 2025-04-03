@@ -55,8 +55,8 @@ std::string bytes_to_hex_dot_truncate_middle(std::span<const unsigned char> byte
     head_hex = std::min(head_hex, hex.size());
     std::string_view head = tools::string_safe_substr(hex, 0, head_hex);
 
-    tail_hex = std::min(tail_hex, head.size());
-    std::string_view tail = tools::string_safe_substr(head, head.size() - tail_hex, tail_hex);
+    tail_hex = std::min(tail_hex, hex.size());
+    std::string_view tail = tools::string_safe_substr(hex, hex.size() - tail_hex, tail_hex);
 
     std::string result = fmt::format("{}{:.>{}}{}", head, "", dot_size, tail);
     return result;
@@ -313,10 +313,15 @@ namespace {
             for (const auto& item : list) {
                 fmt::format_to(
                         std::back_inserter(buffer),
-                        "  - SN {} BLS {} XKEY {} @ {:<21} => {}\n",
+                        "  - SN {} BLS {} XKEY {} v{}.{}.{}{} @ {:<21} => {}\n",
                         bytes_to_hex_dot_truncate_middle(item.addr.sn_pubkey),
                         bytes_to_hex_dot_truncate_middle(item.addr.bls_pubkey),
                         bytes_to_hex_dot_truncate_middle(item.addr.x_pubkey),
+                        item.addr.version[0],
+                        item.addr.version[1],
+                        item.addr.version[2],
+                        item.addr.version_tag.size() ? "-{:<14}"_format(item.addr.version_tag)
+                                                     : " {:<14}"_format(""),
                         "{}:{}"_format(
                                 epee::string_tools::get_ip_string_from_int32(item.addr.ip),
                                 item.addr.port),
@@ -576,7 +581,7 @@ namespace {
 #endif
                 }
 
-                log::debug(logcat, "Initiating {} request to {}", endpoint, connid.to_string());
+                log::trace(logcat, "Initiating {} request to {}", endpoint, connid.to_string());
                 core.omq().request(
                         connid,
                         endpoint,
@@ -584,7 +589,7 @@ namespace {
                          self = shared_from_this(),
                          disconnect = !is_sn_conn ? connid : oxenmq::ConnectionID{},
                          &snode](bool success, std::vector<std::string> data) {
-                            log::debug(
+                            log::trace(
                                     logcat,
                                     "{} from {}",
                                     success ? "Successful response" : "Failure",
