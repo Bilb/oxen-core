@@ -2309,11 +2309,7 @@ bool core::handle_uptime_proof(
 
         // devnet/stagenet don't have storage server or lokinet, so these should be 0; everywhere
         // else they should be non-zero.
-        if (!get_config(m_nettype).HAVE_STORAGE_AND_LOKINET) {
-            if (proof->storage_omq_port != 0 || proof->storage_https_port != 0)
-                throw oxen::traced<std::runtime_error>{
-                        "Invalid storage port(s) in proof: devnet storage ports must be 0"};
-        } else {
+        if (get_config(m_nettype).HAVE_STORAGE_AND_LOKINET) {
             if (proof->storage_omq_port == 0 || proof->storage_https_port == 0)
                 throw oxen::traced<std::runtime_error>{
                         "Invalid storage port(s) in proof: storage ports cannot be 0"};
