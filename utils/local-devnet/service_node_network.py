@@ -1104,6 +1104,8 @@ class SNNetwork:
         if storage_server_path and integration_tests:
             test_storage_server_replication(self.all_nodes)
 
+
+
         # NOTE: Tests complete
         elapsed_time = time.perf_counter() - begin_time
         vprint("Local Devnet SN network setup complete in {}s!".format(elapsed_time))
@@ -1142,6 +1144,8 @@ class SNNetwork:
            str(pathlib.Path(first_wallet.walletdir) / first_wallet.name),
            first_node.listen_ip,
            first_node.rpc_port))
+        buy_ons_result = first_wallet.buy_session_ons("testqa", "05df4a36db2dea751b359ea104c7f310b33e743f455763b9daad90603829f4a535")
+        vprint("Buy ons result: {}!".format(buy_ons_result))
 
 
     def refresh_wallets(self, *, extra=[]):

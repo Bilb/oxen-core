@@ -569,6 +569,10 @@ class Wallet(RPCDaemon):
             else:
                 raise e
 
+    def buy_session_ons(self, display_name, session_id):
+        result = self.json_rpc('ons_buy_mapping', {'type':"session", 'name':display_name, 'value':session_id}).json()['result']
+        return result
+
     def register_sn_for_contributions(self, sn, cut, amount, staking_requirement):
         r = sn.json_rpc("get_service_node_registration_cmd", {
             "contributor_addresses": [self.address()],
