@@ -982,7 +982,17 @@ std::optional<timings> get_round_timings(
             times->prev_timestamp + conf.TARGET_BLOCK_TIME - conf.PULSE_MAX_START_ADJUSTMENT,
             times->prev_timestamp + conf.TARGET_BLOCK_TIME + conf.PULSE_MAX_START_ADJUSTMENT);
 
-    times->miner_fallback_timestamp = times->r0_timestamp + (conf.PULSE_ROUND_TIMEOUT * 255);
+    // A PoW "backup" block only becomes valid this many pulse rounds after the round-0 start. The
+    // default (255 rounds = ~17min at localdev's 4s rounds) makes a stalled devnet painful to
+    // recover: the pulse quorum frequently stalls at the HF20->HF21 transition, and until the
+    // fallback window opens oxend rejects the PoW blocks that would nudge the chain forward. Shorten
+    // it on localdev so a stalled chain can be mined past within ~40s. It stays comfortably larger
+    // than the handful of rounds a healthy pulse quorum needs, so legitimate (possibly multi-round)
+    // pulse blocks are still accepted as pulse rather than being misvalidated as miner blocks.
+    int miner_fallback_rounds =
+            conf.NETWORK_TYPE == cryptonote::network_type::LOCALDEV ? 10 : 255;
+    times->miner_fallback_timestamp =
+            times->r0_timestamp + (conf.PULSE_ROUND_TIMEOUT * miner_fallback_rounds);
     return times;
 }
 

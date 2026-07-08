@@ -1082,6 +1082,48 @@ class SNNetwork:
 
         self.do_hf21_transition();
 
+        # A storage server refuses all requests until oxend's get_service_nodes reports hardfork
+        # >= 19.6. On localdev that revision only exists at HF20+, whose activation height is 170.
+        # But get_service_nodes reports the *service-node-list* height, which lags the chain tip by
+        # one block, so the tip must reach 171 before get_service_nodes reports 170/HF20. Blocks past
+        # height 170 are produced by pulse, which usually makes the block within a few seconds but
+        # occasionally stalls at this transition (see do_hf21_transition). When it stalls we nudge
+        # the miner to produce a PoW backup block; localdev shortens the pulse backup window (see
+        # get_round_timings() in pulse.cpp) so that backup block is accepted within seconds. The
+        # already-running storage servers re-poll and become ready as soon as the tip moves past 170.
+        if storage_server_path:
+            def all_sns_see_hf20():
+                for sn in self.sns:
+                    result = sn.json_rpc("get_service_nodes", {"fields": {"hardfork": True}}).json()["result"]
+                    if result.get("hardfork", 0) < 20:
+                        return False
+                return True
+
+            vprint("Waiting for chain to advance past the HF20 activation height so storage servers become ready")
+            try:
+                # Fast path: give pulse a short window to produce the block on its own.
+                wait_for(all_sns_see_hf20, timeout=15, sleep_s=2)
+                vprint("get_service_nodes reports HF>=20 on all service nodes; storage servers are ready")
+            except RuntimeError:
+                # Pulse stalled -- kick the miner. With the shortened localdev backup window a PoW
+                # block becomes valid within seconds, advancing the tip past 170. Poll for readiness
+                # rather than blocking inside mine() (which would spin forever if a block can't yet
+                # be produced), then stop mining once the storage servers can see HF20.
+                vprint("Pulse has not advanced past height 170; nudging the miner to produce a backup block")
+                mining_node = self.mike.node
+                mining_node.rpc("/start_mining", {
+                    "miner_address": self.mike.address(),
+                    "threads_count": 1,
+                    "slow_mining": False,
+                })
+                try:
+                    wait_for(all_sns_see_hf20, timeout=180, sleep_s=2)
+                    vprint("get_service_nodes reports HF>=20 on all service nodes; storage servers are ready")
+                except RuntimeError:
+                    vprint("WARNING: chain did not advance past height 170 within timeout; storage servers may stay 'not ready'")
+                finally:
+                    mining_node.rpc("/stop_mining")
+
         # NOTE: Do tests
         if integration_tests:
             staker      = self.sn_contract.hardhat_account0
