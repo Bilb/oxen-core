@@ -1148,6 +1148,14 @@ class SNNetwork:
 
             wallet_rows.append(row)
 
+        # Buy an ONS mapping while the wallets are still alive. This MUST run before the
+        # wallet termination below: terminate() only sends SIGTERM (it does not wait), so if
+        # the buy runs afterwards the wallet RPC is mid-shutdown and the request races it --
+        # the tx broadcasts but the server closes before returning a response, which the
+        # Python client sees as a dropped connection and (uncaught) aborts the whole run.
+        buy_ons_result = self.wallets[0].buy_session_ons("testqa", "05df4a36db2dea751b359ea104c7f310b33e743f455763b9daad90603829f4a535")
+        vprint("Buy ons result: {}!".format(buy_ons_result))
+
         # Kill the wallets (not necessary to run any more)
         vprint("Terminating {} wallets".format(len(self.wallets) + len(self.extrawallets)))
         for w in self.wallets:
@@ -1202,8 +1210,6 @@ class SNNetwork:
            str(pathlib.Path(first_wallet.walletdir) / first_wallet.name),
            first_node.listen_ip,
            first_node.rpc_port))
-        buy_ons_result = first_wallet.buy_session_ons("testqa", "05df4a36db2dea751b359ea104c7f310b33e743f455763b9daad90603829f4a535")
-        vprint("Buy ons result: {}!".format(buy_ons_result))
 
 
     def refresh_wallets(self, *, extra=[]):
