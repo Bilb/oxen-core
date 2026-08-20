@@ -85,6 +85,72 @@ def all_service_nodes_proofed(sn):
             result = False
     return result
 
+
+# How many ACTIVE service nodes this network must have to be worth handing over.
+#
+# Active is not the same as registered, and not the same as proofed. A node decommissioned during the
+# initial mining keeps submitting uptime proofs and still answers requests, but oxend leaves it
+# `active=False` with no swarm and omits it from `active_nodes_bin` — the list clients build their snode
+# pool from. So the existing `all_service_nodes_proofed` check passes on a network short of usable nodes.
+#
+# It matters because clients gate on the count: libSession discards any snode pool refresh below its
+# `cache_min_size` (12 at the time of writing) and retries indefinitely, so a network below that leaves a
+# client unable to build a pool at all. It surfaces as "account not found" during a restore, a long way
+# from the cause. Checked here, before the chain is cached, because decommissioning is recorded in blocks
+# and no blocks are produced after setup — a node decommissioned here can never be recommissioned, and
+# caching the chain bakes the shortfall into every later restore of this data dir.
+#
+# A threshold rather than "all of them": losing one or two during the initial mining is routine, so
+# demanding the full set would fail setup on something harmless. 13 tolerates losing 2 of the
+# SERVICE_NODE_COUNT registered below while still landing one above the client's floor of 12, rather than
+# on it — sitting exactly on the floor would pass a network that the next lost node breaks, which is the
+# trap this exists to prevent.
+MIN_ACTIVE_SERVICE_NODES = 13
+
+
+# How many service nodes to register. 15 is the ceiling, not a preference.
+#
+# The node count decides the HEIGHT at which registrations land, and registrations are disabled from
+# hf20_eth_transition onwards ("Temp period: registrations disabled" in cryptonote_config.h), which
+# localdev puts at height 170. The chain is `6*sns + 77` blocks deep by the time the last node registers
+# (46, then 6 per node to fund the 100-coin stakes out of ~18.9-coin coinbases, then 30 for registration
+# and blink quorum lag), so:
+#
+#     6*sns + 77 < 170   ->   sns <= 15
+#
+# Past that, `get_service_node_registration_cmd` fails with "Failed to make registration command" and the
+# staking requirement has already switched to the post-transition value, several steps from the cause.
+# The multi-contributor path needs 20 more pre-transition blocks for its contributions, which gives
+# `6*sns + 97 < 170` -> sns <= 12 — the stock default, and why --skip-multi-contributor is what makes
+# anything above 12 reachable at all.
+#
+# Raising this further means moving the localdev hard fork heights, not just this number.
+SERVICE_NODE_COUNT = 15
+
+
+# Upper bound on the mine-to-transition loop below, which normally has very little to do: 3 blocks at
+# SERVICE_NODE_COUNT = 15, 21 at the stock 12 with --skip-multi-contributor, 1 at the stock 12 without it.
+# This is deliberately far above all of those, so that a fork height the schedule cannot reach fails
+# loudly instead of mining forever.
+MAX_BLOCKS_TO_TRANSITION = 250
+
+
+# hf20_eth_transition. The fork that disables registrations and puts BLS pubkeys in uptime proofs, so it
+# is the point the setup below has to reach before it sends any proof.
+HF_ETH_TRANSITION = 20
+
+
+def count_active_service_nodes(sn):
+    """How many registered service nodes are ACTIVE, which is what clients are served.
+
+    Being proofed is not the same as being active: a node decommissioned during the initial mining
+    keeps submitting uptime proofs and still answers requests, but oxend leaves it `active=False` with
+    no swarm, and it is then omitted from `active_nodes_bin` — the list clients actually build their
+    snode pool from. So `all_service_nodes_proofed` can pass on a network that is short of usable nodes.
+    """
+    service_nodes = sn.json_rpc("get_n_service_nodes", {"fields": {"active": True}}).json()['result']['service_node_states']
+    return sum(1 for x in service_nodes if x.get('active'))
+
 def node_index_is_solo_node(index: int, num_nodes: int):
     result: bool = index > (num_nodes / 2)
     return result
@@ -820,9 +886,10 @@ class SNNetwork:
                  session_token_contracts_dir: pathlib.Path,
                  storage_server_path: pathlib.Path | None,
                  cache_at_hf20=False,
+                 skip_multi_contributor=False,
                  integration_tests: bool,
                  listen_ip: str | None,
-                 sns=12,
+                 sns=SERVICE_NODE_COUNT,
                  nodes=3):
 
         begin_time = time.perf_counter()
@@ -1030,16 +1097,47 @@ class SNNetwork:
 
             self.print_wallet_balances()
 
-            # Register the last SN through Bobs wallet (Has not done any others)
-            # and also get 9 other wallets to contribute the rest of the node with a 10% operator fee
-            self.bob.register_sn_for_contributions(sn=self.sns[-1], cut=10, amount=coins(28), staking_requirement=self.sns[0].get_staking_requirement())
-            self.sync_nodes(self.mine(20), timeout=120) # Height 169
-            self.print_wallet_balances()
-            for wallet in self.extrawallets:
-                wallet.contribute_to_sn(self.sns[-1], coins(8))
+            if skip_multi_contributor:
+                # Registered like every other node. The multi-contributor path below exists to exercise
+                # oxen's own contributor limit and reward batching, and nothing downstream treats this node
+                # differently — `self.sns[-1]` is not referenced again — so a network being used to test
+                # clients pays ~10 transactions and a 20-block confirmation window for coverage it never
+                # uses.
+                vprint("Registering the last service node normally (--skip-multi-contributor)")
+                self.mike.register_sn(self.sns[-1], self.sns[0].get_staking_requirement())
+            else:
+                # Register the last SN through Bobs wallet (Has not done any others)
+                # and also get 9 other wallets to contribute the rest of the node with a 10% operator fee
+                self.bob.register_sn_for_contributions(sn=self.sns[-1], cut=10, amount=coins(28), staking_requirement=self.sns[0].get_staking_requirement())
+                self.sync_nodes(self.mine(20), timeout=120) # Height 169
+                self.print_wallet_balances()
+                for wallet in self.extrawallets:
+                    wallet.contribute_to_sn(self.sns[-1], coins(8))
 
-            # Submit block to enter the BLS transition ##################################################
-            self.sync_nodes(self.mine(1), timeout=120) # Height 170
+            # Submit blocks to enter the BLS transition #################################################
+            #
+            # Mine until the daemon reports it has crossed, rather than assuming the transition is exactly
+            # one block away. The stock schedule reaches it by coincidence of the node count: the chain is
+            # `6*sns + 77` blocks deep after the last registration and the multi-contributor path adds 20
+            # more, which at sns=12 lands exactly on the localdev hf20 height. Both terms scale with `sns`
+            # and the hard fork height does not, so any other node count — or --skip-multi-contributor,
+            # which drops those 20 — stops short, and the uptime proofs below are then sent before the
+            # fork that introduces the BLS pubkeys they carry. Asking the daemon cannot drift from the
+            # hard fork table the way a hard-coded block count does.
+            mined_to_transition = 0
+            while self.sns[0].get_info().hard_fork < HF_ETH_TRANSITION:
+                if mined_to_transition >= MAX_BLOCKS_TO_TRANSITION:
+                    raise RuntimeError(
+                        "Mined {} blocks without reaching hf{} (the BLS transition); the network is at "
+                        "hf{} and height {}. Refusing to send BLS uptime proofs below the fork that "
+                        "introduces them.".format(
+                            mined_to_transition, HF_ETH_TRANSITION,
+                            self.sns[0].get_info().hard_fork, self.sns[0].height()))
+                self.sync_nodes(self.mine(1), timeout=120)
+                mined_to_transition += 1
+            if mined_to_transition:
+                vprint("Mined {} block(s) to reach the BLS transition (hf{})".format(
+                    mined_to_transition, HF_ETH_TRANSITION))
 
             # NOTE: Start storage server
             if storage_server_path and not storage_servers_started:
@@ -1055,6 +1153,39 @@ class SNNetwork:
             for sn in self.sns:
                 wait_for(lambda: all_service_nodes_proofed(sn), timeout=120, sleep_s = 5)
             vprint(timestamp=False)
+
+            # Refuse to cache a chain that is too short of ACTIVE nodes, and refuse to hand it over.
+            #
+            # This is the last moment either can be fixed. Decommissioning is recorded in blocks, and no
+            # blocks are produced after setup — the script idles at an `input()` below — so the active set
+            # is frozen from here on and a decommissioned node can never be recommissioned. Cache it and
+            # the shortfall is baked into every later restore of this data dir.
+            #
+            # Why a threshold rather than "all of them": a node or two being decommissioned during the
+            # initial mining is normal, and looks load-dependent — a storage server lagging its uptime
+            # proof while a few hundred blocks are mined on a busy host. Demanding the full set would fail
+            # the build on something routine, so this targets `sns` and accepts anything at or above
+            # MIN_ACTIVE_SERVICE_NODES, which leaves headroom over what clients require.
+            #
+            # The floor matters because clients gate on it: libSession discards any snode pool refresh
+            # below its own `cache_min_size` (12 at the time of writing) and retries indefinitely, so a
+            # network short of that leaves a client unable to build a pool at all. It surfaces as
+            # "account not found" during a restore, six steps removed from the cause.
+            active_count = count_active_service_nodes(self.sns[0])
+            if active_count < MIN_ACTIVE_SERVICE_NODES:
+                raise RuntimeError(
+                    "Only {}/{} service nodes are ACTIVE, below the {} required. The rest were "
+                    "decommissioned during setup and cannot recover, because no further blocks are "
+                    "produced. Refusing to continue: the chain would be cached in this state and every "
+                    "client built on it would see a short pool.".format(
+                        active_count, len(self.sns), MIN_ACTIVE_SERVICE_NODES
+                    )
+                )
+            if active_count < len(self.sns):
+                vprint("WARNING: {}/{} service nodes are active (>= {} required, continuing)".format(
+                    active_count, len(self.sns), MIN_ACTIVE_SERVICE_NODES))
+            else:
+                vprint("All {} service nodes are active".format(active_count))
 
             if cache_at_hf20:
                 shutil.rmtree(cache_dir, ignore_errors=True)
@@ -1566,6 +1697,16 @@ def run():
                             help=('Set the path to  where the blockchain will be stored'),
                             type=pathlib.Path,
                             default=os.getcwd() + "/testdata")
+    arg_parser.add_argument('--skip-multi-contributor',
+                            help=("Register the last service node like every other one instead of as a "
+                                  "multi-contributor node. The multi-contributor path exists to exercise "
+                                  "oxen's own maximum-contributor limit (operator plus 9 others) and "
+                                  "reward batching; nothing downstream treats that node differently, so a "
+                                  "network being used to test CLIENTS gains nothing from it and pays "
+                                  "roughly ten transactions plus a 20-block confirmation window for it on "
+                                  "every cold build."),
+                            default=False,
+                            action='store_true')
     arg_parser.add_argument('--cache-at-hf20',
                             help=("Start the network by using a blockchain cached at HF20. If "
                                   "the cached blockchain doesn't exist, the chain will be "
@@ -1607,6 +1748,7 @@ def run():
                         session_token_contracts_dir = args.session_token_contracts_dir,
                         storage_server_path         = args.storage_server_path,
                         cache_at_hf20               = args.cache_at_hf20,
+                        skip_multi_contributor      = args.skip_multi_contributor,
                         integration_tests           = args.integration_tests,
                         listen_ip                   = args.listen_ip)
     else:

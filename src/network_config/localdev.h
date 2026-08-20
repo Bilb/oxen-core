@@ -50,7 +50,21 @@ inline constexpr network_config config{
         .PULSE_STAGE_TIMEOUT = 3s,
         .PULSE_ROUND_TIMEOUT = 4s,
         .PULSE_MAX_START_ADJUSTMENT = 4s,
-        .PULSE_MIN_SERVICE_NODES = testnet::config.PULSE_MIN_SERVICE_NODES,
+        // Kept deliberately above any localdev node count, which leaves Pulse dormant and block
+        // production on the PoW fallback for the whole life of the network.
+        //
+        // No Pulse round ever completes here. Every node runs on one machine and the setup script fakes
+        // the uptime proofs, so from the moment the 12th node becomes active each block waits out a full
+        // set of rounds before the fallback produces it: measured at a dead-constant 49.0s per block with
+        // PULSE_ROUND_TIMEOUT = 4s, stepping to 41.0s after hf20. That is ~25 minutes for the ~31 blocks a
+        // cold build mines after its registrations, and it is the entire cost of building this network.
+        //
+        // The fallback is not a degradation: generate_pulse_quorum_with_candidates() returns an empty
+        // quorum below the minimum by design, and this network already produces its first ~150 blocks that
+        // way, post-hf20 blocks included. Nothing a client observes depends on how a block was produced —
+        // clients read the service node list, swarms and storage servers, never blocks. What this gives up
+        // is Pulse and blink quorum coverage, which a network built to test clients does not exercise.
+        .PULSE_MIN_SERVICE_NODES = 1000,
         .BATCHING_INTERVAL = testnet::config.BATCHING_INTERVAL,
         .MIN_BATCH_PAYMENT_AMOUNT = mainnet::config.MIN_BATCH_PAYMENT_AMOUNT,
         .LIMIT_BATCH_OUTPUTS = mainnet::config.LIMIT_BATCH_OUTPUTS,
