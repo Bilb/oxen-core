@@ -85,6 +85,18 @@ def all_service_nodes_proofed(sn):
             result = False
     return result
 
+# Upper bound on the mine-to-transition loop below, which normally has very little to do: 3 blocks at
+# SERVICE_NODE_COUNT = 15, 21 at the stock 12 with --skip-multi-contributor, 1 at the stock 12 without it.
+# This is deliberately far above all of those, so that a fork height the schedule cannot reach fails
+# loudly instead of mining forever.
+MAX_BLOCKS_TO_TRANSITION = 250
+
+
+# hf20_eth_transition. The fork that disables registrations and puts BLS pubkeys in uptime proofs, so it
+# is the point the setup below has to reach before it sends any proof.
+HF_ETH_TRANSITION = 20
+
+
 def node_index_is_solo_node(index: int, num_nodes: int):
     result: bool = index > (num_nodes / 2)
     return result
@@ -1038,8 +1050,29 @@ class SNNetwork:
             for wallet in self.extrawallets:
                 wallet.contribute_to_sn(self.sns[-1], coins(8))
 
-            # Submit block to enter the BLS transition ##################################################
-            self.sync_nodes(self.mine(1), timeout=120) # Height 170
+            # Submit blocks to enter the BLS transition #################################################
+            #
+            # Mine until the daemon reports it has crossed, rather than assuming the transition is exactly
+            # one block away. The stock schedule reaches it by coincidence of the node count: the chain is
+            # `6*sns + 77` blocks deep after the last registration and the multi-contributor path adds 20
+            # more, which at sns=12 lands exactly on the localdev hf20 height. Both terms scale with `sns`
+            # and the hard fork height does not, so any other node count stops short, and the uptime proofs
+            # below are then sent before the fork that introduces the BLS pubkeys they carry. Asking the
+            # daemon cannot drift from the hard fork table the way a hard-coded block count does.
+            mined_to_transition = 0
+            while self.sns[0].get_info().hard_fork < HF_ETH_TRANSITION:
+                if mined_to_transition >= MAX_BLOCKS_TO_TRANSITION:
+                    raise RuntimeError(
+                        "Mined {} blocks without reaching hf{} (the BLS transition); the network is at "
+                        "hf{} and height {}. Refusing to send BLS uptime proofs below the fork that "
+                        "introduces them.".format(
+                            mined_to_transition, HF_ETH_TRANSITION,
+                            self.sns[0].get_info().hard_fork, self.sns[0].height()))
+                self.sync_nodes(self.mine(1), timeout=120)
+                mined_to_transition += 1
+            if mined_to_transition:
+                vprint("Mined {} block(s) to reach the BLS transition (hf{})".format(
+                    mined_to_transition, HF_ETH_TRANSITION))
 
             # NOTE: Start storage server
             if storage_server_path and not storage_servers_started:
