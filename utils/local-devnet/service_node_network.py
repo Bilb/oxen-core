@@ -134,10 +134,47 @@ SERVICE_NODE_COUNT = 15
 # loudly instead of mining forever.
 MAX_BLOCKS_TO_TRANSITION = 250
 
+# Consecutive blocks with an unchanged swarm assignment before the network is considered settled.
+#
+# Swarms are (re)assigned as the chain advances, and a node that MOVES INTO a newly created swarm
+# takes an early return in the storage server's `Swarm::update`: it establishes no contacts with its
+# new swarm-mates, on the reasoning that other nodes will push to it. Those contacts only appear on a
+# LATER swarm update. This network stops producing blocks once setup finishes (pulse is dormant on
+# localdev), so a swarm created on the final block can never replicate: `distribute_command` skips
+# every peer that is not a contact, silently, so a client store lands on ONE node, is answered 200,
+# and never reaches the rest of the swarm.
+#
+# Measured before this: ~half of all accounts had their config on exactly one of 7-8 swarm members,
+# which surfaces as an unexplainable intermittent restore failure. After: 12/12 accounts replicated
+# to every member, in 5-109ms.
+#
+# Counted in *consecutive unchanged* blocks rather than a fixed total, because swarms rebalance
+# progressively towards their ideal size and the number of updates that takes scales with the node
+# count -- a fixed count silently becomes too small if SERVICE_NODE_COUNT changes, and being one
+# block short reintroduces exactly the invisible failure above.
+SWARM_SETTLE_STABLE_BLOCKS = 3
+
+# Upper bound on the settle loop, so a network that never converges fails loudly instead of mining
+# forever. Blocks cost ~270ms here while pulse is dormant; if pulse is ever enabled on localdev they
+# cost ~40s each and this bound becomes expensive, so revisit it then.
+MAX_BLOCKS_FOR_SWARM_SETTLE = 60
+
 
 # hf20_eth_transition. The fork that disables registrations and puts BLS pubkeys in uptime proofs, so it
 # is the point the setup below has to reach before it sends any proof.
 HF_ETH_TRANSITION = 20
+
+
+def swarm_assignment(sn):
+    """Mapping of swarm id -> sorted member pubkeys, as this node currently sees the network."""
+    states = sn.json_rpc(
+        "get_service_nodes",
+        {"fields": {"service_node_pubkey": True, "swarm_id": True}},
+    ).json()["result"].get("service_node_states", [])
+    swarms = {}
+    for state in states:
+        swarms.setdefault(state.get("swarm_id"), []).append(state.get("service_node_pubkey"))
+    return {swarm: sorted(members) for swarm, members in swarms.items()}
 
 
 def count_active_service_nodes(sn):
@@ -1254,6 +1291,51 @@ class SNNetwork:
                     vprint("WARNING: chain did not advance past height 170 within timeout; storage servers may stay 'not ready'")
                 finally:
                     mining_node.rpc("/stop_mining")
+
+        # Let the swarms settle before handing the network over.
+        #
+        # Swarms are (re)assigned as the chain advances, and a node that MOVES INTO a newly created
+        # swarm takes an early return in the storage server's `Swarm::update`: it establishes no
+        # contacts with its new swarm-mates, on the reasoning that other nodes will push to it. Those
+        # contacts only appear on a LATER swarm update. This network then stops producing blocks
+        # (pulse is dormant on localdev), so without a few more blocks that later update never comes
+        # and the new swarm can never replicate: `distribute_command` skips every peer that is not a
+        # contact, silently, so a client store lands on ONE node, is answered 200, and never reaches
+        # the rest of the swarm. Measured before this: ~half of all accounts had their config on
+        # exactly one of 7-8 members, surfacing as an unexplainable intermittent restore failure.
+        #
+        # This has to run AFTER `do_hf21_transition` -- hf21_eth activates at height 171, one block
+        # after hf20, so mining here from the hf20 point would cross hf21 before that step runs and
+        # it fails with an IndexError on a node with no contributors.
+        #
+        # Cheap: blocks cost ~270ms each while pulse is dormant, so ~3s for all of them. If pulse is
+        # ever re-enabled on localdev, blocks cost ~40s each and this becomes minutes -- size it then.
+        vprint("Mining until the swarm assignment settles so new swarms establish their contacts")
+        settled = 0
+        mined_to_settle = 0
+        last_swarms = swarm_assignment(self.sns[0])
+        while settled < SWARM_SETTLE_STABLE_BLOCKS:
+            if mined_to_settle >= MAX_BLOCKS_FOR_SWARM_SETTLE:
+                raise RuntimeError(
+                    "Mined {} blocks and the swarm assignment is still changing ({} swarms: {}). "
+                    "Refusing to hand over a network whose newest swarm may hold messages it can "
+                    "never replicate.".format(
+                        mined_to_settle, len(last_swarms),
+                        {swarm: len(members) for swarm, members in last_swarms.items()}))
+            self.sync_nodes(self.mine(1), timeout=120)
+            mined_to_settle += 1
+            swarms = swarm_assignment(self.sns[0])
+            if swarms == last_swarms:
+                settled += 1
+            else:
+                # Every change restarts the count: the nodes that just moved need a later update
+                # before they know their own swarm-mates.
+                settled = 0
+                vprint("  swarm assignment changed at block {}: {}".format(
+                    mined_to_settle, {swarm: len(members) for swarm, members in swarms.items()}))
+            last_swarms = swarms
+        vprint("Swarms settled after {} block(s): {}".format(
+            mined_to_settle, {swarm: len(members) for swarm, members in last_swarms.items()}))
 
         # NOTE: Do tests
         if integration_tests:
