@@ -1369,6 +1369,31 @@ class SNNetwork:
         buy_ons_result = self.wallets[0].buy_session_ons("testqa", "05df4a36db2dea751b359ea104c7f310b33e743f455763b9daad90603829f4a535")
         vprint("Buy ons result: {}!".format(buy_ons_result))
 
+        # An ONS purchase is only a mempool transaction until a block confirms it, and ONS lookups are
+        # answered from the chain. Without this the mapping exists nowhere a client can see: every
+        # ons_resolve request returns empty, on every platform, for the life of the devnet.
+        #
+        # The wait is not optional. buy_session_ons returns as soon as the WALLET has broadcast, and the
+        # block is mined on a different node -- mining immediately produces a block that does not contain
+        # the transaction, leaving it in the mempool exactly as if nothing had been mined at all.
+        ons_tx_hash = buy_ons_result["tx_hash"]
+        vprint("Waiting for the ONS purchase {} to reach the mempool".format(ons_tx_hash))
+        mining_node = self.mike.node
+        expiry = time.time() + 60
+        while ons_tx_hash not in mining_node.rpc("/get_transaction_pool_hashes").json().get("tx_hashes", []):
+            if time.time() > expiry:
+                raise RuntimeError("ONS purchase {} never reached the mining node's mempool".format(ons_tx_hash))
+            time.sleep(0.5)
+
+        vprint("Mining 1 block to confirm the ONS purchase")
+        self.sync_nodes(self.mine(1), timeout=120)
+
+        # Mined is not the same as included: verify, so a silently-empty ONS registry cannot reach a client.
+        remaining = mining_node.rpc("/get_transaction_pool_hashes").json().get("tx_hashes", [])
+        if ons_tx_hash in remaining:
+            raise RuntimeError("ONS purchase {} is still in the mempool after mining".format(ons_tx_hash))
+        vprint("ONS purchase confirmed on chain")
+
         # Kill the wallets (not necessary to run any more)
         vprint("Terminating {} wallets".format(len(self.wallets) + len(self.extrawallets)))
         for w in self.wallets:
